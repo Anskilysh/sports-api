@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""API-Sport.ru collector v2.6: BOTH MODES COVER THE FULL MOSCOW DAY.
+"""API-Sport.ru collector v2.6.1: BOTH MODES COVER THE FULL MOSCOW DAY.
 Python 3.10+, stdlib only. Place existing .env with API_KEY beside this file.
 python collect_hockey.py                 # fast; all upcoming matches with odds
 python collect_hockey.py --mode full     # all matches and individual player data
@@ -55,7 +55,32 @@ from contextlib import contextmanager
 BASE='https://api.api-sport.ru';MSK=timezone(timedelta(hours=3))
 def now():return datetime.now(timezone.utc).isoformat()
 def write(path,data):
- path=Path(path);path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp');tmp.write_text(json.dumps(data,ensure_ascii=False,allow_nan=False),encoding='utf-8');os.replace(tmp,path)
+ """Stream JSON to an atomic temporary file; never build the full JSON string."""
+ path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+ tmp=path.with_name(path.name+'.'+uuid.uuid4().hex+'.tmp')
+ try:
+  with tmp.open('w',encoding='utf-8',buffering=1024*1024) as fp:
+   json.dump(data,fp,ensure_ascii=False,allow_nan=False,separators=(',',':'))
+   fp.flush();os.fsync(fp.fileno())
+  os.replace(tmp,path)
+ except BaseException:
+  try:tmp.unlink(missing_ok=True)
+  except OSError:pass
+  raise
+
+def redact_in_place(value,secret):
+ """Remove reflected credentials without serializing/copying an entire response."""
+ if isinstance(value,str):return value.replace(secret,'[REDACTED]')
+ if isinstance(value,list):
+  for i,item in enumerate(value):value[i]=redact_in_place(item,secret)
+ elif isinstance(value,dict):
+  renamed=[]
+  for k in value:
+   value[k]=redact_in_place(value[k],secret)
+   if isinstance(k,str) and secret in k:renamed.append(k)
+  for k in renamed:value[k.replace(secret,'[REDACTED]')]=value.pop(k)
+ return value
+
 def load_key(path):
  for l in Path(path).read_text(encoding='utf-8-sig').splitlines():
   if '=' in l and l.split('=',1)[0].strip() in ('API_KEY','API_SPORT_RU_KEY'):
@@ -130,7 +155,7 @@ class Client:
    with build_opener(NoRedirect()).open(Request(url,headers={'Authorization':self.key,'Accept':'application/json','User-Agent':'APISportDesktop/2.3'}),timeout=50) as response:
     r['http_status']=response.status;raw=response.read(80_000_001)
     if len(raw)>80_000_000:raise ValueError('RESPONSE_TOO_LARGE')
-    r['data']=json.loads(raw.decode());r['status']='OK'
+    r['data']=json.loads(raw);del raw;r['status']='OK'
     if isinstance(r['data'],dict) and r['data'].get('error'):r['status']='API_ERROR'
   except HTTPError as e:
    r.update(status='HTTP_ERROR',http_status=e.code)
@@ -140,7 +165,7 @@ class Client:
     with self.mutex:self.blocked=True
   except (URLError,OSError,TimeoutError,ValueError) as e:r.update(status='NETWORK_OR_DECODE_ERROR',error_type=type(e).__name__)
   # Never persist request headers or credential strings, including reflected errors.
-  r=json.loads(json.dumps(r,ensure_ascii=False).replace(self.key,'[REDACTED]'))
+  r=redact_in_place(r,self.key)
   if r['status']=='OK' and ttl and not odds_request:write(cp,r)
   archive=self.root/'history'/'responses'/(ident+'_'+uuid.uuid4().hex+'.json');write(archive,r)
   r['record_id']=archive.stem;self.records.append({k:v for k,v in r.items() if k!='data'});return r
@@ -1107,7 +1132,7 @@ def main(argv=None):
         data['analysis_config']={'uncertainty_draws':args.uncertainty_draws}
         attach_analysis(data)
         destination=args.output or args.math_only.with_name(args.math_only.stem+'_math.json')
-        write(destination,data);save_ai_report(destination,data);print(f'Saved: {destination}');return 0
+        save_ai_report(destination,data);write(destination,data);print(f'Saved: {destination}');return 0
     if args.max_events is None:args.max_events=0
     if args.minutes is None:args.minutes=0
     try:
@@ -1146,14 +1171,17 @@ def main(argv=None):
                 result['analysis_config']={'uncertainty_draws':args.uncertainty_draws,'history_days':args.history_days}
                 try:attach_analysis(result)
                 except Exception as e:result['mathematics']={'status':'FAILED','error_type':type(e).__name__}
-                print('Saving final JSON...',flush=True)
-                write(output, result)
+                print('Saving AI_REPORT first (streaming)...',flush=True)
                 save_ai_report(output,result)
+                print('AI_REPORT saved. Saving full JSON (streaming)...',flush=True)
+                write(output, result)
+                print('Full JSON saved.',flush=True)
             print(f"Saved: {output}\nStatus: {result['status']}; matches: {len(result.get('matches', []))}; requests: {c.calls}")
             if result['status'] in ('QUOTA_UNVERIFIED', 'SPORT_NOT_IN_SUBSCRIPTION', 'COMPLETED_WITH_GAPS'):
                 exit_code = exit_code or 2
     except (RuntimeError, OSError, ValueError) as e:
-        print('Cannot start/save: ' + (str(e) if isinstance(e, RuntimeError) else type(e).__name__), file=sys.stderr)
+        detail=str(e) if isinstance(e,RuntimeError) else (f'{type(e).__name__}: errno={e.errno}, {e.strerror}' if isinstance(e,OSError) else type(e).__name__)
+        print('Cannot start/save: '+detail,file=sys.stderr)
         return 1
     return exit_code
 
